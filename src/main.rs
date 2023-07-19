@@ -1,6 +1,7 @@
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use alloc::collections;
+extern crate uuid;
+
+use mongodb::bson::doc;
+use uuid::Uuid;
 use warp::{self,Filter};
 use serde::{Deserialize, Serialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -10,52 +11,114 @@ use warp::reject::{Rejection, Reject};
 use jsonwebtoken::{encode, EncodingKey, Header, Algorithm};
 use jsonwebtoken::errors::Result as JWTResult;
 
-//Custom error type for rejecting requests with custom error messages... for some reason, I couldn't get the default warp::reject::Rejection to work.
+/**Custom error type for rejecting requests with custom error messages... for some reason, I couldn't get the default warp::reject::Rejection to work.*/
 #[derive(Debug)]
 struct CustomError(String);
-
 impl Reject for CustomError {}
-
 fn custom_error(msg: &str) -> warp::Rejection {
     warp::reject::custom(CustomError(msg.to_string()))
 }
 
-//User struct - containes user fields that will be stored in the database
-#[derive(Serialize,Deserialize)]
+/**User struct - containes user fields that will be stored in the database
+ * 
+ * 
+*/
+
+#[derive(Serialize,Deserialize,Debug)]
 struct User {
     email: String,
-    password: String,
+    password_hash: String,
     location: String,
     phone: String,
     uid: uuid::Uuid,
     //other user fields
 }
 
-struct Collections{
-    users: mongodb::Collection,
-    events: mongodb::Collection,
+/**
+ * LoginRequest struct - contains fields that will be sent in a user login request
+ */
+#[derive(Serialize,Deserialize)]
+struct LoginRequest {
+    email: String,
+    password_hash: String,
 }
 
-//JWT token claims - Sub is user id, exp is expiration
-//A JWT token is generated when a user logs in successfully and is sent to the client
+/**
+ * RegisterRequest struct - contains fields that will be sent in a user registration request
+ * # Parameters:
+ * * email: String
+ * * password_hash: String
+ * * name: String
+ * * date_of_birth: String
+ * * location: String
+ * * phone: String
+ * # TODO: Add other user fields?
+ */
+#[derive(Serialize,Deserialize)]
+struct RegisterRequest {
+    email: String,
+    password_hash: String,
+    name: String,
+    date_of_birth: String,
+    location: String,
+    phone: String,
+}
+
+/**
+ * Event struct - contains event fields that will be stored in the database
+ * # Parameters:
+ * * name: String
+ * * location: String
+ * * date: String
+ * * time: String
+ * * description: String
+ * # TODO: Add other event fields?
+ */
+struct Event {
+    name: String,
+    location: String,
+    date: String,
+    time: String,
+    description: String,
+    //other event fields
+}
+
+
+/**
+ * Collections struct - contains mongodb collections that will be used to store users and events
+ * # Parameters:
+ * * users: mongodb::Collection<User>
+ * * events: mongodb::Collection<Event>
+ * # TODO: Add other collections?
+ */
+
+#[derive(Clone)]
+struct Collections{
+    users: mongodb::Collection<User>,
+    events: mongodb::Collection<Event>,
+}
+
+/**
+ * Claims struct - contains fields that will be used to generate a JWT token for maintaining user sessions
+ */
 #[derive(Serialize,Deserialize)]
 struct Claims{
     sub:String,
     exp:usize,
 }
 
-//mock database
-// TODO: Replace with actual database(s) - mongodb and neo4j
-type Db = Arc<Mutex<HashMap<i128,User>>>;
 
-
-//Main function - starts the server and defines the routes for the api
+/**
+ * # Main function 
+ * * tokio server
+ * * Uses warp to create routes and handle requests
+ * Uses mongodb driver to connect to the database
+ * 
+ */
 #[tokio::main]
 async fn main(){
 
-let userDB: Db = Arc::new(Mutex::new(HashMap::new()));
-
-let client_options = mongodb::options::ClientOptions::parse("mongodb://localhost:27017").await.unwrap();
+let mut client_options = mongodb::options::ClientOptions::parse("mongodb://localhost:27017").await.unwrap();
 client_options.app_name = Some("RustUserServer".to_string());
 
 let client = mongodb::Client::with_options(client_options).unwrap();
@@ -83,7 +146,15 @@ let login_route = warp::post()
     .and(warp::body::json())
     .and(with_db(collections.clone()))
     .and_then(login_handler);
+
 //TODO: Add other routes (user profile, user search, etc.)
+
+//TODO: Add authentication middleware
+
+//TODO: Add error handling middleware
+
+
+
 
 //Combine all routes
 let routes = register_route.or(login_route);
@@ -97,50 +168,97 @@ warp::serve(routes).run(([0, 0, 0, 0], 8000)).await;
 
 
 //Handles User Registration Requests
-async fn register_handler(user: User, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
-    let hashed_password = hash(&user.password, DEFAULT_COST)
+async fn register_handler(request: RegisterRequest, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
+    
+    let hashed_password = hash(&request.password_hash, DEFAULT_COST)
         .map_err(|_|custom_error("Hashing failed"))?;
-    let mut user = user;
-    user.password = hashed_password;
 
-    //TODO: Check if email or user id already exists, if yes return error, else insert into db
+    // 1. Search for user with email
+    let filter = doc! {"email": &request.email};
+    let user_check = collections.users.find_one(filter.clone(), None).await;
 
+    //2. If user with email exists, return error
+    if let Ok(Some(_)) = user_check {
+        return Ok(warp::reply::json(&"User with this email already exists"));
+    }
 
-    //TODO: Generate unique user id
+    //3. If user with email doesn't exist, insert into db
+    let new_user = User{
+        email: request.email,
+        password_hash: hashed_password,
+        location: request.location,
+        phone: request.phone,
+        uid: Uuid::new_v4(),
+    };
 
-    let mut map = db.lock().unwrap();
-    map.insert(user.uid.clone(), user);
+    let user_doc = mongodb::bson::to_document(&new_user)
+    .map_err(|_| custom_error("Failed to convert user to document"))?;
+    
+    // Insert the new user into the database
+    let _ = collections.users.insert_one(new_user, None).await
+        .map_err(|_| custom_error("Failed to insert new user"))?;
 
     Ok(warp::reply::json(&"Registered successfully"))
 }
 
-//Handles User Login Requests
-async fn login_handler(user: User, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
-    let map = db.lock().unwrap();
-    match map.get(&user.uid) {
-        Some(stored_user) => {
-            // Compare hashed passwords
-            if verify(&user.password, &stored_user.password)
-                .map_err(|_| custom_error("Verification failed"))? {
-                let claims = Claims {
-                    sub: user.email.clone(),
-                    // Replace with the actual expiration time
-                    exp: 10000000000,
-                };
-                match generate_token(claims) {
-                    Ok(token) => Ok(warp::reply::json(&token)),
-                    Err(_) => Ok(warp::reply::json(&"Token generation failed")),
-                }
-            } else {
-                Ok(warp::reply::json(&"Invalid email or password"))
-            }
-        }
-        None => Ok(warp::reply::json(&"Invalid email or password")),
-    }
-}
 
-async fn create_event_handler(event: Event, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
-}
+
+
+/**
+ * # Handles User Login Requests
+ * 
+ * 
+ */
+async fn login_handler(request: LoginRequest, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
+    
+    // 1. Search for user with email
+    let filter = doc! {"email": &request.email};
+
+    let stored_user_doc_option: Result<Option<mongodb::bson::Document>, _> = Err(collections.users.find_one(filter, None).await);
+
+    match stored_user_doc_option{
+
+        Ok(Some(stored_user_doc)) => {
+            
+            match mongodb::bson::from_document::<User>(stored_user_doc){
+                Ok(stored_user) =>{
+                    
+
+                    //2. If user with email exists, verify password
+                    let password_matches = verify(&request.password_hash, &stored_user.password_hash)
+                        .map_err(|_| custom_error("Failed to verify password"))?;
+
+                    //3. If password matches, generate JWT token and return it
+                    if password_matches {
+                        let claims = Claims{
+                            sub: stored_user.uid.to_string(),
+                            exp: 10000000000,
+                        };
+                        let token = generate_token(claims)
+                            .map_err(|_| custom_error("Failed to generate token"))?;
+                        return Ok(warp::reply::json(&token));
+                    }
+                    //4. If password doesn't match, return error
+                    else {
+                        return Ok(warp::reply::json(&"Invalid email or password"));
+                    }
+                },
+                Err(_) => {
+                    return Ok(warp::reply::json(&"Failed to parse user data"));
+                },
+            }
+        },
+
+
+        Ok(None) => Ok(warp::reply::json(&"Invalid email or password")),
+        
+        Err(_) => Ok(warp::reply::json(&"Failed to query the database")),
+        }
+    }
+
+
+// async fn create_event_handler(event: Event, collections: Collections) -> Result<impl warp::Reply, warp::Rejection> {
+// }
 
 fn generate_token(claims: Claims) -> JWTResult<String> {
     let key = "secret".as_ref(); // Replace with your actual secret key
@@ -148,6 +266,6 @@ fn generate_token(claims: Claims) -> JWTResult<String> {
 }
 
 //Helper function to pass the database to the handlers, since warp doesn't support passing state to handlers.
-fn with_db(collections: Collections) -> impl Filter<Extract = (Collections), Error = std::convert::Infallible> + Clone{
+fn with_db(collections: Collections) -> impl Filter<Extract = (Collections,), Error = std::convert::Infallible> + Clone{
     warp::any().map(move || collections.clone())
 }
